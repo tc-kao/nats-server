@@ -138,7 +138,7 @@ type ServerInfo struct {
 	Cluster   string    `json:"cluster,omitempty"`
 	Version   string    `json:"ver"`
 	Seq       uint64    `json:"seq"`
-	JetStream bool      `json:"jetstream"`
+	JetStream bool      `json:"jetstream,omitempty"`
 	Time      time.Time `json:"time"`
 }
 
