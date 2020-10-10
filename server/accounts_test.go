@@ -2466,7 +2466,7 @@ func TestAccountSimpleWeightedRouteMapping(t *testing.T) {
 	defer s.Shutdown()
 
 	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
-	acc.AddWeightedMappings("foo", &RouteDest{"bar", 50, ""})
+	acc.AddWeightedMappings("foo", &MapDest{"bar", 50})
 
 	nc := natsConnect(t, s.ClientURL())
 	defer nc.Close()
@@ -2500,31 +2500,31 @@ func TestAccountMultiWeightedRouteMappings(t *testing.T) {
 	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
 
 	// Check failures for bad weights.
-	shouldErr := func(rds ...*RouteDest) {
+	shouldErr := func(rds ...*MapDest) {
 		t.Helper()
 		if acc.AddWeightedMappings("foo", rds...) == nil {
 			t.Fatalf("Expected an error, got none")
 		}
 	}
-	shouldNotErr := func(rds ...*RouteDest) {
+	shouldNotErr := func(rds ...*MapDest) {
 		t.Helper()
 		if err := acc.AddWeightedMappings("foo", rds...); err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 	}
 
-	shouldErr(&RouteDest{"bar", 150, ""})
-	shouldNotErr(&RouteDest{"bar", 50, ""})
-	shouldNotErr(&RouteDest{"bar", 50, ""}, &RouteDest{"baz", 50, ""})
+	shouldErr(&MapDest{"bar", 150})
+	shouldNotErr(&MapDest{"bar", 50})
+	shouldNotErr(&MapDest{"bar", 50}, &MapDest{"baz", 50})
 	// Same dest duplicated should error.
-	shouldErr(&RouteDest{"bar", 50, ""}, &RouteDest{"bar", 50, ""})
+	shouldErr(&MapDest{"bar", 50}, &MapDest{"bar", 50})
 	// total over 100
-	shouldErr(&RouteDest{"bar", 50, ""}, &RouteDest{"baz", 60, ""})
+	shouldErr(&MapDest{"bar", 50}, &MapDest{"baz", 60})
 
 	acc.RemoveMapping("foo")
 
 	// 20 for original, you can leave it off will be auto-added.
-	shouldNotErr(&RouteDest{"bar", 50, ""}, &RouteDest{"baz", 30, ""})
+	shouldNotErr(&MapDest{"bar", 50}, &MapDest{"baz", 30})
 
 	nc := natsConnect(t, s.ClientURL())
 	defer nc.Close()
@@ -2633,7 +2633,7 @@ func TestSamplingHeader(t *testing.T) {
 func TestSubjectTransforms(t *testing.T) {
 	shouldErr := func(src, dest string) {
 		t.Helper()
-		if _, err := NewTransform(src, dest); err != ErrBadSubject {
+		if _, err := newTransform(src, dest); err != ErrBadSubject {
 			t.Fatalf("Did not get an error for src=%q and dest=%q", src, dest)
 		}
 	}
@@ -2651,9 +2651,9 @@ func TestSubjectTransforms(t *testing.T) {
 	shouldErr("foo.>", "bar.baz")  // fwcs have to match.
 	shouldErr("foo.*.*", "bar.$2") // Must place all pwcs.
 
-	shouldBeOK := func(src, dest string) *Transform {
+	shouldBeOK := func(src, dest string) *transform {
 		t.Helper()
-		tr, err := NewTransform(src, dest)
+		tr, err := newTransform(src, dest)
 		if err != nil {
 			t.Fatalf("Got an error %v for src=%q and dest=%q", err, src, dest)
 		}
@@ -2667,7 +2667,7 @@ func TestSubjectTransforms(t *testing.T) {
 	shouldMatch := func(src, dest, sample, expected string) {
 		t.Helper()
 		tr := shouldBeOK(src, dest)
-		s, err := tr.Match(sample)
+		s, err := tr.match(sample)
 		if err != nil {
 			t.Fatalf("Got an error %v when expecting a match for %q to %q", err, sample, expected)
 		}

@@ -64,7 +64,7 @@ type Account struct {
 	lqws         map[string]int32
 	usersRevoked map[string]int64
 	actsRevoked  map[string]int64
-	routeMapping map[string][]*RouteDest
+	mappings     []*mapping
 	lleafs       []*client
 	imports      importMap
 	exports      exportMap
@@ -201,13 +201,6 @@ type importMap struct {
 	streams  []*streamImport
 	services map[string]*serviceImport
 	rrMap    map[string][]*serviceRespEntry
-}
-
-// RouteDest is for mapping published subjects for clients.
-type RouteDest struct {
-	Subject       string
-	Weight        uint8
-	ClusterFilter string
 }
 
 // NewAccount creates a new unlimited account with the given name.
@@ -497,14 +490,34 @@ func (a *Account) TotalSubs() int {
 	return int(a.sl.Count())
 }
 
+// MapDest is for mapping published subjects for clients.
+type MapDest struct {
+	Subject string
+	Weight  uint8
+}
+
+// destination is for internal representation for a weighted mapped destination.
+type destination struct {
+	tr     *transform
+	weight uint8
+}
+
+// mapping is an internal entry for mapping subjects.
+type mapping struct {
+	src   string
+	wc    bool
+	dests []*destination
+}
+
 // AddMapping adds in a simple route mapping from src subject to dest subject
 // for inbound client messages.
 func (a *Account) AddMapping(src, dest string) error {
-	return a.AddWeightedMappings(src, &RouteDest{dest, 100, ""})
+	return a.AddWeightedMappings(src, &MapDest{dest, 100})
 }
 
 // AddWeightedMapping will add in a weighted mappings for the destinations.
-func (a *Account) AddWeightedMappings(src string, dests ...*RouteDest) error {
+// TODO(dlc) - Allow cluster filtering
+func (a *Account) AddWeightedMappings(src string, dests ...*MapDest) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -512,8 +525,9 @@ func (a *Account) AddWeightedMappings(src string, dests ...*RouteDest) error {
 		return ErrBadSubject
 	}
 
+	m := &mapping{src: src, wc: subjectHasWildcard(src), dests: make([]*destination, 0, len(dests)+1)}
 	seen := make(map[string]struct{})
-	ndests := make([]*RouteDest, 0, len(dests)+1)
+
 	var tw uint8
 	for _, d := range dests {
 		if _, ok := seen[string(d.Subject)]; ok {
@@ -530,36 +544,56 @@ func (a *Account) AddWeightedMappings(src string, dests ...*RouteDest) error {
 		if !IsValidSubject(string(d.Subject)) {
 			return ErrBadSubject
 		}
-		ndests = append(ndests, &RouteDest{d.Subject, d.Weight, d.ClusterFilter})
+		tr, err := newTransform(src, d.Subject)
+		if err != nil {
+			return err
+		}
+
+		m.dests = append(m.dests, &destination{tr, d.Weight})
 	}
 
 	// Auto add in original at weight if all entries weight does not total to 100.
 	if tw != 100 {
-		ndests = append(ndests, &RouteDest{src, 100 - tw, ""})
+		tr, err := newTransform(src, src)
+		if err != nil {
+			return err
+		}
+		m.dests = append(m.dests, &destination{tr, 100 - tw})
 	}
-	sort.Slice(ndests, func(i, j int) bool { return ndests[i].Weight < ndests[j].Weight })
+	sort.Slice(m.dests, func(i, j int) bool { return m.dests[i].weight < m.dests[j].weight })
+
 	var lw uint8
-	for _, d := range ndests {
-		d.Weight += lw
-		lw = d.Weight
+	for _, d := range m.dests {
+		d.weight += lw
+		lw = d.weight
 	}
-
-	if a.routeMapping == nil {
-		a.routeMapping = make(map[string][]*RouteDest)
+	// Replace an old one if it exists.
+	for i, m := range a.mappings {
+		if m.src == src {
+			a.mappings[i] = m
+			return nil
+		}
 	}
-	// TODO(dlc) - check wildcards
+	// If we did not replace add to the end.
+	a.mappings = append(a.mappings, m)
 
-	a.routeMapping[src] = ndests
 	return nil
 }
 
 // RemoveMapping will remove an existing mapping.
-func (a *Account) RemoveMapping(src string) {
+func (a *Account) RemoveMapping(src string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.routeMapping != nil {
-		delete(a.routeMapping, src)
+	for i, m := range a.mappings {
+		if m.src == src {
+			// Swap last one into this spot. Its ok to change order.
+			a.mappings[i] = a.mappings[len(a.mappings)-1]
+			a.mappings[len(a.mappings)-1] = nil // gc
+			a.mappings = a.mappings[:len(a.mappings)-1]
+			return true
+		}
 	}
+	return false
 }
 
 // Indicates we have mapping entries.
@@ -568,42 +602,83 @@ func (a *Account) hasMappings() bool {
 		return false
 	}
 	a.mu.RLock()
-	n := len(a.routeMapping)
+	n := len(a.mappings)
 	a.mu.RUnlock()
 	return n > 0
 }
 
-// This performs the logic to map to a new dest subject based on route mappings.
+// This performs the logic to map to a new dest subject based on mappings.
 // Should only be called from processInboundClientMsg.
 func (a *Account) selectMappedSubject(c *client) []byte {
 	dest := c.pa.subject
 	a.mu.RLock()
 
-	if a.routeMapping == nil {
+	if len(a.mappings) == 0 {
 		a.mu.RUnlock()
 		return dest
 	}
 
-	rms, ok := a.routeMapping[string(dest)]
-	if !ok {
+	// In case we have to tokenize for subset matching.
+	tsa := [32]string{}
+	tts := tsa[:0]
+
+	var m *mapping
+	for _, rm := range a.mappings {
+		if !rm.wc && rm.src == string(dest) {
+			m = rm
+			break
+		} else {
+			// tokenize and reuse for subset matching.
+			if len(tts) == 0 {
+				start := 0
+				subject := string(dest)
+				for i := 0; i < len(subject); i++ {
+					if subject[i] == btsep {
+						tts = append(tts, subject[start:i])
+						start = i + 1
+					}
+				}
+				tts = append(tts, subject[start:])
+			}
+			if isSubsetMatch(tts, rm.src) {
+				m = rm
+				break
+			}
+		}
+	}
+
+	if m == nil {
 		a.mu.RUnlock()
 		return dest
 	}
+
+	// The selected destination for the mapping.
+	var d *destination
+
 	// Optimize for single entry case.
-	if len(rms) == 1 && rms[0].Weight == 100 {
-		dest = []byte(rms[0].Subject)
+	if len(m.dests) == 1 && m.dests[0].weight == 100 {
+		d = m.dests[0]
 	} else {
 		if a.prand == nil {
 			a.prand = rand.New(rand.NewSource(time.Now().UnixNano()))
 		}
 		w := uint8(a.prand.Int31n(100))
-		for _, rm := range rms {
-			if w <= rm.Weight {
-				dest = []byte(rm.Subject)
+		for _, rm := range m.dests {
+			if w <= rm.weight {
+				d = rm
 				break
 			}
 		}
 	}
+
+	if d != nil {
+		if len(d.tr.dtpi) == 0 {
+			dest = []byte(d.tr.dest)
+		} else if nsubj, err := d.tr.transform(tts); err == nil {
+			dest = []byte(nsubj)
+		}
+	}
+
 	a.mu.RUnlock()
 	return dest
 }
@@ -3246,7 +3321,7 @@ func (dr *CacheDirAccResolver) Reload() error {
 // Transforms for arbitrarily mapping subjects from one to another for maps, tees and filters.
 // These can also be used for proper mapping on wildcard exports/imports.
 // These will be grouped and caching and locking are assumed to be in the upper layers.
-type Transform struct {
+type transform struct {
 	src, dest string
 	dtoks     []string
 	stoks     []string
@@ -3264,7 +3339,8 @@ func placeHolderIndex(token string) int {
 	return -1
 }
 
-func NewTransform(src, dest string) (*Transform, error) {
+// newTransform will create a new transform checking the src and dest subjects for accuracy.
+func newTransform(src, dest string) (*transform, error) {
 	// Both entries need to be valid subjects.
 	sv, stokens, npwcs, hasFwc := subjectInfo(src)
 	dv, dtokens, dnpwcs, dHasFwc := subjectInfo(dest)
@@ -3306,10 +3382,13 @@ func NewTransform(src, dest string) (*Transform, error) {
 		}
 	}
 
-	return &Transform{src: src, dest: dest, dtoks: dtokens, stoks: stokens, dtpi: dtpi}, nil
+	return &transform{src: src, dest: dest, dtoks: dtokens, stoks: stokens, dtpi: dtpi}, nil
 }
 
-func (tr *Transform) Match(subject string) (string, error) {
+// match will take a literal published subject that is associated with a client and will match and transform
+// the subject if possible.
+// TODO(dlc) - We could add in client here to allow for things like foo -> foo.$ACCOUNT
+func (tr *transform) match(subject string) (string, error) {
 	// Tokenize the subject. This should always be a literal subject.
 	tsa := [32]string{}
 	tts := tsa[:0]
@@ -3332,8 +3411,7 @@ func (tr *Transform) Match(subject string) (string, error) {
 }
 
 // Do a transform on the subject to the dest subject.
-// Read lock should be held.
-func (tr *Transform) transform(tokens []string) (string, error) {
+func (tr *transform) transform(tokens []string) (string, error) {
 	if len(tr.dtpi) == 0 {
 		return tr.dest, nil
 	}
