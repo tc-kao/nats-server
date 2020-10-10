@@ -3219,6 +3219,11 @@ func (c *client) processInboundMsg(msg []byte) {
 	}
 }
 
+// selectMappedSubject will chose the mapped subject based on the client's inbound subject.
+func (c *client) selectMappedSubject() {
+	c.pa.subject = []byte(c.acc.selectMappedSubject(string(c.pa.subject)))
+}
+
 // processInboundClientMsg is called to process an inbound msg from a client.
 func (c *client) processInboundClientMsg(msg []byte) bool {
 	// Update statistics
@@ -3239,7 +3244,7 @@ func (c *client) processInboundClientMsg(msg []byte) bool {
 
 	// Check if we have and account mappings or tees or filters.
 	if c.kind == CLIENT && c.in.flags.isSet(hasMappings) {
-		c.pa.subject = c.acc.selectMappedSubject(c)
+		c.selectMappedSubject()
 	}
 
 	// Check pub permissions
@@ -3479,6 +3484,11 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	if si.hasWC {
 		to = string(c.pa.subject)
 	}
+
+	// Now check to see if this account has mappings that could affect the service import.
+	// Can't use non locked trick like in processInboundClientMsg, so just call into selectMappedSubject
+	// so we only lock once.
+	to = si.acc.selectMappedSubject(to)
 
 	// FIXME(dlc) - Do L1 cache trick like normal client?
 	rr := si.acc.sl.Match(to)
