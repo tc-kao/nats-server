@@ -2594,9 +2594,12 @@ func TestAccountServiceImportWithRouteMappings(t *testing.T) {
 	ncBar.Publish("request", nil)
 	ncBar.Flush()
 
-	if n, _, _ := fooSub.Pending(); n != 1 {
-		t.Fatalf("Expected a request for %q, but got %d", fooSub.Subject, n)
-	}
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if n, _, _ := fooSub.Pending(); n != 1 {
+			return fmt.Errorf("Expected a request for %q, but got %d", fooSub.Subject, n)
+		}
+		return nil
+	})
 }
 
 func BenchmarkNewRouteReply(b *testing.B) {
