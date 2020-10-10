@@ -943,18 +943,6 @@ func (c *client) flushClients(budget time.Duration) time.Time {
 	return last
 }
 
-// Helper to set/clear readcache flag.
-func (c *client) checkAndSetAccountMappings() {
-	if c.kind != CLIENT {
-		return
-	}
-	if c.acc.hasMappings() {
-		c.in.flags.set(hasMappings)
-	} else {
-		c.in.flags.clear(hasMappings)
-	}
-}
-
 // readLoop is the main socket read functionality.
 // Runs in its own Go routine.
 func (c *client) readLoop(pre []byte) {
@@ -967,6 +955,7 @@ func (c *client) readLoop(pre []byte) {
 		c.mu.Unlock()
 		return
 	}
+	acc := c.acc
 	nc := c.nc
 	ws := c.ws != nil
 	c.in.rsz = startBufSize
@@ -1037,8 +1026,12 @@ func (c *client) readLoop(pre []byte) {
 
 		// Check if the account has mappings and if so set the local readcache flag.
 		// We check here to make sure any changes such as config reload are reflected here.
-		if c.kind == CLIENT {
-			c.checkAndSetAccountMappings()
+		if c.kind == CLIENT && acc != nil {
+			if acc.hasMappings() {
+				c.in.flags.set(hasMappings)
+			} else {
+				c.in.flags.clear(hasMappings)
+			}
 		}
 
 		// Clear inbound stats cache
